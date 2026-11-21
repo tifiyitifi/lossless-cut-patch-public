@@ -1,0 +1,137 @@
+name: Release (Windows)
+
+# Fork-only workflow: push to the `squash-release` branch -> build Windows 7z/zip ->
+# create the tag `v<package.json version>` and a GitHub release pointing at it.
+# Version bumps come from `package.json`; if the tag already exists the run is a
+# no-op, so pushing to `squash-release` again without a version bump publishes nothing.
+# `squash-release` only ever receives one squashed commit per release (see AGENTS.md).
+on:
+  push:
+    branches:
+      - squash-release
+  workflow_dispatch:
+
+concurrency:
+  group: release-win
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      should_release: ${{ steps.gate.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read version from package.json
+        id: ver
+        run: |
+          VERSION=$(jq -r .version package.json)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the tag already exists
+        id: gate
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "Tag $TAG already exists - nothing to release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $TAG does not exist yet - will build and release."
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-release:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      # Windows fix. See https://github.com/actions/checkout/issues/226
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v6
+
+      - run: corepack enable
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: 'yarn'
+
+      # Because of timeout issue https://github.com/yarnpkg/yarn/issues/4890
+      - run: yarn install --immutable --network-timeout 1000000
+
+      - name: (Windows x64) Download ffmpeg
+        run: yarn download-ffmpeg-win32-x64
+
+      - run: yarn build
+
+      # Explicit targets override win.target in package.json (7z + appx for both
+      # x64 and arm64), so this produces exactly the two portable archives.
+      - name: Package Windows x64 (7z + zip)
+        run: yarn electron-builder --publish never --win 7z zip --x64
+
+      - name: Verify packages
+        shell: pwsh
+        run: |
+          $version = $env:VERSION
+          $files = @(
+            "dist/LosslessCut-Patch-$version-win-x64.7z",
+            "dist/LosslessCut-Patch-$version-win-x64.zip"
+          )
+          foreach ($file in $files) {
+            if (-not (Test-Path $file)) { throw "missing package: $file" }
+            Get-Item $file | Select-Object Name, Length | Format-Table
+          }
+
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $lines = @()
+          $version = $env:VERSION
+          foreach ($file in Get-ChildItem "dist/LosslessCut-Patch-$version-win-x64.7z", "dist/LosslessCut-Patch-$version-win-x64.zip") {
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower()
+            $lines += "$hash  $($file.Name)"
+          }
+          $lines | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Prepare release notes
+        shell: pwsh
+        run: |
+          $notes = "versions/${{ needs.check.outputs.version }}.md"
+          if (Test-Path $notes) {
+            Copy-Item $notes dist/release-notes.md
+          } else {
+            "LosslessCut $env:TAG" | Set-Content dist/release-notes.md -Encoding utf8
+          }
+          Get-Content dist/release-notes.md
+
+      - name: Create tag and release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Branch pushes do not create tags for us, and the repository default
+          # branch is not `squash-release`, so the tag has to be anchored explicitly.
+          tag_name: ${{ needs.check.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: LosslessCut ${{ needs.check.outputs.version }}
+          body_path: dist/release-notes.md
+          draft: false
+          prerelease: false
+          files: |
+            dist/LosslessCut-Patch-${{ needs.check.outputs.version }}-win-x64.7z
+            dist/LosslessCut-Patch-${{ needs.check.outputs.version }}-win-x64.zip
+            dist/SHA256SUMS.txt

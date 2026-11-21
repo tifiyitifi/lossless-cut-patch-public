@@ -1,0 +1,13 @@
+/*
+The landing's guidance is the only selectable text in the patch landing.
+
+`NoFileLoaded` wraps the landing in `.no-user-select`, whose global rule (main.css) turns
+selection off on *every* descendant, so the override has to reach the children as well and has to
+outrank that rule. It is scoped here instead of loosening the global rule, which base mode and the
+rest of the app rely on.
+*/
+.selectable,
+.selectable * {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+}

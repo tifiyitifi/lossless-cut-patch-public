@@ -1,0 +1,426 @@
+import Store from 'electron-store';
+// eslint-disable-next-line import-js/no-extraneous-dependencies
+import electron from 'electron';
+import { join, dirname } from 'node:path';
+import assert from 'node:assert';
+import { copyFile } from 'node:fs/promises';
+
+import type { KeyBinding, Config } from '../common/types.js';
+import { withPatchCommandConsoleBinding } from '../common/features/patchCommand/consoleKeyBinding.js';
+import { defaultKeyBindings } from '../common/features/patchKeys/index.js';
+import { withAddedPatchKeys, withKeyBindingScopes, withoutRemovedPatchKeys, withRenamedPatchKeys, withRetargetedPatchKeys } from '../common/features/patchKeys/migrate.js';
+import logger from './logger.js';
+import { isWindows, pathExists } from './util.js';
+
+const { app } = electron;
+
+const defaults: Config = {
+  version: 6,
+  lastAppVersion: app.getVersion(),
+  captureFormat: 'jpeg',
+  enableCustomOutDir: false,
+  recentCustomOutDirs: [],
+  keyframeCut: true,
+  autoMerge: false,
+  autoDeleteMergedSegments: true,
+  segmentsToChaptersOnly: false,
+  enableSmartCut: false,
+  timecodeFormat: 'timecodeWithDecimalFraction',
+  invertCutSegments: false,
+  autoExportExtraStreams: true,
+  exportConfirmEnabled: true,
+  askBeforeClose: false,
+  enableImportChapters: 'ask',
+  enableAskForFileOpenAction: true,
+  playbackVolume: 0.3, // so that we don't shock new users with loud volume
+  autoSaveProjectFile: true,
+  // patch: numeric seconds by default, so a base-mode `.llc` stays version 2 and upstream builds can
+  // open it. The readable timecode format (version 3) is opt-in.
+  llcTimeFormat: 'seconds',
+  wheelSensitivity: 0.2,
+  waveformHeight: 40,
+  // patch: `null` is the "System language" setting, so a fresh config follows the OS locale.
+  language: null,
+  ffmpegExperimental: false,
+  preserveChapters: true,
+  preserveMetadata: 'default',
+  preserveMetadataOnMerge: false,
+  preserveMovData: false,
+  movFastStart: true,
+  avoidNegativeTs: 'make_zero',
+  hideNotifications: undefined,
+  hideOsNotifications: undefined,
+  autoLoadTimecode: false,
+  segmentsToChapters: false,
+  simpleMode: true,
+  outSegTemplate: undefined,
+  mergedFileTemplate: undefined,
+  mergedFilesTemplate: undefined,
+  keyboardSeekAccFactor: 1.03,
+  keyboardNormalSeekSpeed: 1,
+  keyboardSeekSpeed2: 10,
+  keyboardSeekSpeed3: 60,
+  treatInputFileModifiedTimeAsStart: true,
+  treatOutputFileModifiedTimeAsStart: true,
+  outFormatLocked: undefined,
+  safeOutputFileName: true,
+  windowBounds: undefined,
+  enableAutoHtml5ify: true,
+  keyBindings: [...defaultKeyBindings],
+  customFfPath: undefined,
+  lastDialogDir: undefined,
+  storeProjectInWorkingDir: true,
+  enableOverwriteOutput: true,
+  mouseWheelZoomModifierKey: 'ctrl',
+  mouseWheelFrameSeekModifierKey: 'alt',
+  mouseWheelKeyframeSeekModifierKey: 'shift',
+  segmentMouseModifierKey: 'shift',
+  captureFrameMethod: 'videotag', // we don't default to ffmpeg because ffmpeg might choose a frame slightly off
+  captureFrameQuality: 0.95,
+  captureFrameFileNameFormat: 'timestamp',
+  enableNativeHevc: true,
+  enableUpdateCheck: true,
+  cleanupChoices: {
+    trashTmpFiles: true, askForCleanup: true, closeFile: true, cleanupAfterExport: false,
+  },
+  allowMultipleInstances: false,
+  theme: 'dark',
+  videoFit: 'contain',
+  preferStrongColors: false,
+  outputFileNameMinZeroPadding: 1,
+  cutFromAdjustmentFrames: 0,
+  cutToAdjustmentFrames: 0,
+  invertTimelineScroll: undefined,
+  storeWindowBounds: true,
+  waveformMode: undefined,
+  thumbnailsEnabled: false,
+  keyframesEnabled: true,
+  reducedMotion: 'user',
+  ffmpegHwaccel: 'none',
+  // A source can be stored so that a lossless copy is unusable (see features/damagedSource).
+  // Repairing is the default on both sides: an unplayable preview and a wrong export are worse than
+  // the cost of a transcode, and the export one only re-encodes the parts that are actually cut.
+  damagedSourcePlaybackRepair: true,
+  damagedSourcePlaybackRepairQuality: 'smooth',
+  damagedSourceExportRepair: true,
+  // patch pairs with base: base = upstream UI, patch = this fork's workflow layer (see EntryMode).
+  entryMode: 'patch',
+  commandAliases: [],
+  commandConsolePosition: undefined,
+  keyboardPracticePopupMode: 'per-guide',
+  keyboardPracticePosition: undefined,
+};
+
+const configFileName = 'config.json'; // note: this is also hard-coded inside electron-store
+
+// look for a config.json file next to the executable
+// For portable app: https://github.com/mifi/lossless-cut/issues/645
+async function lookForNeighbourConfigFile() {
+  try {
+    // https://github.com/mifi/lossless-cut/issues/645#issuecomment-1001363314
+    // https://stackoverflow.com/questions/46307797/how-to-get-the-original-path-of-a-portable-electron-app
+    // https://github.com/electron-userland/electron-builder/blob/master/docs/configuration/nsis.md
+    if (!isWindows || process.windowsStore) return undefined;
+    const appExeDir = process.env['PORTABLE_EXECUTABLE_DIR'] || dirname(app.getPath('exe'));
+    const customConfigPath = join(appExeDir, configFileName);
+    if (await pathExists(customConfigPath)) return appExeDir;
+
+    return undefined;
+  } catch (err) {
+    logger.error('Failed to get custom storage path', err);
+    return undefined;
+  }
+}
+
+let store: Store;
+
+export function get<T extends keyof Config>(key: T): Config[T] {
+  return store.get(key);
+}
+
+export function set<T extends keyof Config>(key: T, val: Config[T]) {
+  if (val === undefined) store.delete(key);
+  else store.set(key, val);
+}
+
+export function onDidChange<T extends keyof Config>(key: T, callback: (val: Config[T]) => void) {
+  return store.onDidChange(key, (val) => callback(val as Config[T]));
+}
+
+export function reset(key: keyof Config) {
+  set(key, defaults[key]);
+}
+
+async function tryCreateStore({ customStoragePath }: { customStoragePath: string | undefined }) {
+  for (let i = 0; i < 5; i += 1) {
+    try {
+      store = new Store({
+        defaults,
+        ...(customStoragePath != null && { cwd: customStoragePath }),
+      });
+      return;
+    } catch (err) {
+      await new Promise((resolve) => { setTimeout(resolve, 2000); });
+      logger.error('Failed to create config store, retrying', err);
+    }
+  }
+
+  throw new Error('Timed out while creating config store');
+}
+
+let customStoragePath: string | undefined;
+
+export const getConfigPath = () => customStoragePath ?? join(app.getPath('userData'), configFileName); // custom path, or default used by electron-store
+
+async function tryBackupConfigFile(oldConfigVersion: number, appVersion: string) {
+  try {
+    const configPath = getConfigPath();
+    const backupPath = `${configPath}.backup-v${appVersion}-${oldConfigVersion}-${Date.now()}`;
+    await copyFile(configPath, backupPath);
+    logger.info(`Backed up config file to ${backupPath}`);
+  } catch (err) {
+    logger.error('Failed to backup config file', err);
+  }
+}
+
+export async function init({ customConfigDir }: { customConfigDir: string | undefined }) {
+  customStoragePath = customConfigDir ?? await lookForNeighbourConfigFile();
+  if (customStoragePath) logger.info('customStoragePath', customStoragePath);
+
+  await tryCreateStore({ customStoragePath });
+
+  // migrate old configs:
+  const enableTransferTimestamps = store.get('enableTransferTimestamps'); // todo remove after a while
+  if (enableTransferTimestamps != null) {
+    logger.info('Migrating enableTransferTimestamps');
+    store.delete('enableTransferTimestamps');
+    set('treatOutputFileModifiedTimeAsStart', enableTransferTimestamps ? true : undefined);
+  }
+
+  const darkMode = store.get('darkMode'); // todo remove after a while
+  if (darkMode != null) {
+    logger.info('Migrating darkMode to theme');
+    store.delete('darkMode');
+    set('theme', darkMode ? 'dark' : 'light');
+  }
+
+  const cleanupChoices = store.get('cleanupChoices'); // todo remove after a while
+  if (cleanupChoices != null && cleanupChoices.closeFile == null) {
+    logger.info('Migrating cleanupChoices.closeFile');
+    set('cleanupChoices', { ...cleanupChoices, closeFile: true });
+  }
+
+  const customOutDir = store.get('customOutDir'); // todo remove after a while
+  if (customOutDir != null) {
+    logger.info('Migrating customOutDir to recentCustomOutDirs');
+    store.delete('customOutDir');
+    set('recentCustomOutDirs', [customOutDir]);
+    set('enableCustomOutDir', customOutDir != null);
+  }
+
+  // const configVersion: number = store.get('version');
+
+  const keyBindings = (store.get('keyBindings') as KeyBinding[]).map(({ keys, action }) => ({ keysStr: keys, keys: keys.split('+'), action }));
+
+  // assume that if there is one binding with ctrl, then it's the old format where keys were stored as strings like "Ctrl+Shift+S". We want to migrate to the new format where keys are stored as "ControlLeft+ShiftLeft+KeyS"
+  // todo remove after a while
+  if (keyBindings.some(({ keys }) => keys.some((k) => k.toLowerCase() === 'ctrl'))) {
+    await tryBackupConfigFile(1, app.getVersion());
+
+    const newBindings = keyBindings.map(({ keys: keysOrig, keysStr, action }) => {
+      try {
+        assert.ok(keysOrig.length > 0 && keysOrig.every((k) => k.length > 0), 'Invalid keys');
+
+        const map: Record<string, string> = {
+          /* eslint-disable @stylistic/quote-props */
+          'esc': 'Escape',
+          '1': 'Digit1',
+          '2': 'Digit2',
+          '3': 'Digit3',
+          '4': 'Digit4',
+          '5': 'Digit5',
+          '6': 'Digit6',
+          '7': 'Digit7',
+          '8': 'Digit8',
+          '9': 'Digit9',
+          '0': 'Digit0',
+          '-': 'Minus',
+          '=': 'Equal',
+          'backspace': 'Backspace',
+          'tab': 'Tab',
+          'q': 'KeyQ',
+          'w': 'KeyW',
+          'e': 'KeyE',
+          'r': 'KeyR',
+          't': 'KeyT',
+          'y': 'KeyY',
+          'u': 'KeyU',
+          'i': 'KeyI',
+          'o': 'KeyO',
+          'p': 'KeyP',
+          '[': 'BracketLeft',
+          ']': 'BracketRight',
+          'enter': 'Enter',
+          'a': 'KeyA',
+          's': 'KeyS',
+          'd': 'KeyD',
+          'f': 'KeyF',
+          'g': 'KeyG',
+          'h': 'KeyH',
+          'j': 'KeyJ',
+          'k': 'KeyK',
+          'l': 'KeyL',
+          ';': 'Semicolon',
+          '\'': 'Quote',
+          '`': 'Backquote',
+          '\\': 'Backslash',
+          'z': 'KeyZ',
+          'x': 'KeyX',
+          'c': 'KeyC',
+          'v': 'KeyV',
+          'b': 'KeyB',
+          'n': 'KeyN',
+          'm': 'KeyM',
+          ',': 'Comma',
+          '.': 'Period',
+          '/': 'Slash',
+          '*': 'NumpadMultiply',
+          'space': 'Space',
+          'capslock': 'CapsLock',
+          'f1': 'F1',
+          'f2': 'F2',
+          'f3': 'F3',
+          'f4': 'F4',
+          'f5': 'F5',
+          'f6': 'F6',
+          'f7': 'F7',
+          'f8': 'F8',
+          'f9': 'F9',
+          'f10': 'F10',
+          'pause': 'Pause',
+          'f11': 'F11',
+          'f12': 'F12',
+          'f13': 'F13',
+          'f14': 'F14',
+          'f15': 'F15',
+          'f16': 'F16',
+          'f17': 'F17',
+          'f18': 'F18',
+          'f19': 'F19',
+          'f20': 'F20',
+          'f21': 'F21',
+          'f22': 'F22',
+          'f23': 'F23',
+          'f24': 'F24',
+          '(': 'NumpadParenLeft',
+          ')': 'NumpadParenRight',
+          'help': 'Help',
+          'numlock': 'NumLock',
+          'home': 'Home',
+          'up': 'ArrowUp',
+          'pageup': 'PageUp',
+          'left': 'ArrowLeft',
+          'right': 'ArrowRight',
+          'end': 'End',
+          'down': 'ArrowDown',
+          'pagedown': 'PageDown',
+          'ins': 'Insert',
+          'del': 'Delete',
+
+          // modifiers
+          'ctrl': 'ControlLeft',
+          'shift': 'ShiftLeft',
+          'alt': 'AltLeft',
+          'meta': 'MetaLeft',
+          /* eslint-enable @stylistic/quote-props */
+        };
+
+        const newKeys = keysOrig.flatMap((k) => {
+          if (k === 'plus') return ['shift', '='];
+          if (k === 'command') return ['meta'];
+          if (k === 'option') return ['alt'];
+          if (k === 'return') return ['enter'];
+          if (k === 'escape') return ['esc'];
+          return [k];
+        }).map((k) => {
+          const mapped = map[k.toLowerCase()];
+          assert.ok(mapped != null, `Unknown key: ${k}`);
+          return mapped;
+        });
+
+        return { keys: newKeys.join('+'), action };
+      } catch (err) {
+        logger.error('Failed to migrate old keyboard binding', keysStr, action, err);
+        return { keys: keysStr, action };
+      }
+    });
+    set('keyBindings', newBindings);
+
+    logger.info('Migrated config to version 2');
+    set('version', 2);
+  }
+
+  // v3: give existing configs the patch command console binding. Version-gated (not "add when
+  // missing") so a user who deliberately unbinds it in the keyboard settings keeps it unbound.
+  const configVersion = (store.get('version') as number | undefined) ?? 1;
+  if (configVersion < 3) {
+    const bindings = store.get('keyBindings') as KeyBinding[];
+    if (bindings.length !== withPatchCommandConsoleBinding(bindings).length) {
+      logger.info('Migrating: adding the patch command console binding');
+      set('keyBindings', withPatchCommandConsoleBinding(bindings));
+    }
+    set('version', 3);
+  }
+
+  // v4: the three shortcut scopes. Every stored row gets its scope (the shipped defaults get theirs,
+  // anything else becomes a user binding) and the missing patch defaults are appended, enabled.
+  // Runs after v3, so the console binding is already in the table and is scoped as a patch default.
+  if (configVersion < 4) {
+    const bindings = store.get('keyBindings') as KeyBinding[];
+    logger.info('Migrating: adding the key binding scopes and the patch defaults');
+    set('keyBindings', withKeyBindingScopes(bindings));
+    set('version', 4);
+  }
+
+  // v5: Z became the 1x/last-speed toggle and D/F swapped step directions. A stored config still
+  // carries the old patch rows (electron-store only fills missing keys), so retarget the rows that
+  // are still exactly the old defaults; user-rebound and switched-off keys stay as they are.
+  // Runs after v4, so every row now carries its scope.
+  if (configVersion < 5) {
+    const bindings = store.get('keyBindings') as KeyBinding[];
+    logger.info('Migrating: retargeting the patch transport keys');
+    set('keyBindings', withRetargetedPatchKeys(bindings));
+    set('version', 5);
+  }
+
+  // v6: the finish-and-keep key moved from `Shift+G` to `Shift+F`. `withRetargetedPatchKeys` can
+  // only change an action, so the rename is its own step; it runs after v4, when every row carries
+  // its scope. A key the user already has on `Shift+F` wins, and the action keeps `Shift+G` then -
+  // dropping it would leave the action with no key at all.
+  if (configVersion < 6) {
+    const bindings = store.get('keyBindings') as KeyBinding[];
+    logger.info('Migrating: renaming the finish-and-keep key');
+    set('keyBindings', withRenamedPatchKeys(bindings));
+    set('version', 6);
+  }
+
+  // v7: patch mode moved the preview volume to `-` / `=` and put the cut marking on Alt+Up / Down,
+  // and added `Alt+Q` for the app menu bar. A stored config keeps the old rows, so append the new
+  // patch defaults - unless a binding of the user's own already claims the combination.
+  if (configVersion < 7) {
+    const bindings = store.get('keyBindings') as KeyBinding[];
+    logger.info('Migrating: adding the patch volume, marking and menu keys');
+    set('keyBindings', withAddedPatchKeys(bindings));
+    set('version', 7);
+  }
+
+  // v8: `Shift+Alt+Left` / `Right` was briefly restored as a fourth cut-marking pair in v7 and then
+  // removed at the user's request. Drop those two rows from a config that already ran v7, while
+  // leaving a user binding on the same combination alone.
+  if (configVersion < 8) {
+    const bindings = store.get('keyBindings') as KeyBinding[];
+    logger.info('Migrating: removing the fourth cut-marking pair');
+    set('keyBindings', withoutRemovedPatchKeys(bindings));
+    set('version', 8);
+  }
+}
